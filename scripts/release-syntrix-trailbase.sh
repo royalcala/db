@@ -3,6 +3,7 @@ set -euo pipefail
 
 BUMP_TYPE="${1:-patch}"
 DIST_TAG="${2:-latest}"
+NPM_SCOPE="${3:-@roy.alcala}"
 
 REPO_ROOT="$(pwd)"
 TMP_DIR="$(mktemp -d)"
@@ -31,34 +32,34 @@ git clone --quiet "${REPO_ROOT}" "${TMP_REPO}"
 cd "${TMP_REPO}"
 
 # Rewrite package names/dependencies for publish artifacts only.
-sed -i "s/\"name\": \"@tanstack\/db-ivm\"/\"name\": \"@syntrix\/db-ivm\"/" packages/db-ivm/package.json
-sed -i "s/\"name\": \"@tanstack\/db\"/\"name\": \"@syntrix\/db\"/" packages/db/package.json
-sed -i "s/\"@tanstack\/db-ivm\": \"workspace:\*\"/\"@syntrix\/db-ivm\": \"workspace:*\"/" packages/db/package.json
-sed -i "s/\"name\": \"@tanstack\/trailbase-db-collection\"/\"name\": \"@syntrix\/trailbase-db-collection\"/" packages/trailbase-db-collection/package.json
-sed -i "s/\"@tanstack\/db\": \"workspace:\*\"/\"@syntrix\/db\": \"workspace:*\"/" packages/trailbase-db-collection/package.json
+sed -i "s|\"name\": \"@tanstack/db-ivm\"|\"name\": \"${NPM_SCOPE}/db-ivm\"|" packages/db-ivm/package.json
+sed -i "s|\"name\": \"@tanstack/db\"|\"name\": \"${NPM_SCOPE}/db\"|" packages/db/package.json
+sed -i "s|\"@tanstack/db-ivm\": \"workspace:\*\"|\"${NPM_SCOPE}/db-ivm\": \"workspace:*\"|" packages/db/package.json
+sed -i "s|\"name\": \"@tanstack/trailbase-db-collection\"|\"name\": \"${NPM_SCOPE}/trailbase-db-collection\"|" packages/trailbase-db-collection/package.json
+sed -i "s|\"@tanstack/db\": \"workspace:\*\"|\"${NPM_SCOPE}/db\": \"workspace:*\"|" packages/trailbase-db-collection/package.json
 
 while IFS= read -r file; do
-  sed -i "s/@tanstack\/db-ivm/@syntrix\/db-ivm/g" "$file"
+  sed -i "s|@tanstack/db-ivm|${NPM_SCOPE}/db-ivm|g" "$file"
 done < <(rg -l "@tanstack/db-ivm" packages/db | grep -E '\\.(ts|tsx|json)$')
 
 while IFS= read -r file; do
-  perl -0pi -e "s/@tanstack\\/db(?!-collection-e2e)/@syntrix\\/db/g" "$file"
+  NPM_SCOPE="$NPM_SCOPE" perl -0pi -e 's/@tanstack\/db(?!-collection-e2e)/$ENV{NPM_SCOPE} . "/db"/ge' "$file"
 done < <(rg -l "@tanstack/db" packages/trailbase-db-collection | grep -E '\\.(ts|tsx|json)$')
 
 pnpm install --no-frozen-lockfile --ignore-scripts
 
 # Build in dependency order.
-pnpm --filter @syntrix/db-ivm build
-pnpm --filter @syntrix/db build
-pnpm --filter @syntrix/trailbase-db-collection build
+pnpm --filter "${NPM_SCOPE}/db-ivm" build
+pnpm --filter "${NPM_SCOPE}/db" build
+pnpm --filter "${NPM_SCOPE}/trailbase-db-collection" build
 
 # Keep versions aligned for the Syntrix release track.
-pnpm --filter @syntrix/db-ivm exec npm version "$BUMP_TYPE" --no-git-tag-version
-pnpm --filter @syntrix/db exec npm version "$BUMP_TYPE" --no-git-tag-version
-pnpm --filter @syntrix/trailbase-db-collection exec npm version "$BUMP_TYPE" --no-git-tag-version
+pnpm --filter "${NPM_SCOPE}/db-ivm" exec npm version "$BUMP_TYPE" --no-git-tag-version
+pnpm --filter "${NPM_SCOPE}/db" exec npm version "$BUMP_TYPE" --no-git-tag-version
+pnpm --filter "${NPM_SCOPE}/trailbase-db-collection" exec npm version "$BUMP_TYPE" --no-git-tag-version
 
-pnpm --filter @syntrix/db-ivm publish --access public --tag "$DIST_TAG" --no-git-checks
-pnpm --filter @syntrix/db publish --access public --tag "$DIST_TAG" --no-git-checks
-pnpm --filter @syntrix/trailbase-db-collection publish --access public --tag "$DIST_TAG" --no-git-checks
+pnpm --filter "${NPM_SCOPE}/db-ivm" publish --access public --tag "$DIST_TAG" --no-git-checks
+pnpm --filter "${NPM_SCOPE}/db" publish --access public --tag "$DIST_TAG" --no-git-checks
+pnpm --filter "${NPM_SCOPE}/trailbase-db-collection" publish --access public --tag "$DIST_TAG" --no-git-checks
 
-echo "Published @syntrix/db-ivm, @syntrix/db, and @syntrix/trailbase-db-collection with bump '$BUMP_TYPE' and tag '$DIST_TAG'."
+echo "Published ${NPM_SCOPE}/db-ivm, ${NPM_SCOPE}/db, and ${NPM_SCOPE}/trailbase-db-collection with bump '$BUMP_TYPE' and tag '$DIST_TAG'."

@@ -4,7 +4,7 @@
 - **Default branch:** `syntrix-main`
 - **Fork owner:** `royalcala`
 - **Upstream:** `TanStack/db` (main branch)
-- **NPM scope:** `@syntrix` (requires NPM_TOKEN secret in GitHub Actions)
+- **NPM scope (default):** `@roy.alcala` (override supported in workflow input)
 
 ---
 
@@ -46,7 +46,7 @@ git push origin fix/your-fix-name
 
 ---
 
-### 3. Publish @syntrix/* packages
+### 3. Publish scoped packages
 **Manual release (local):**
 ```bash
 # Bump patch version (default)
@@ -54,11 +54,14 @@ pnpm release:syntrix:trailbase
 
 # Or with custom bump
 bash scripts/release-syntrix-trailbase.sh minor latest
+
+# Or with custom scope
+bash scripts/release-syntrix-trailbase.sh minor latest @syntrix
 ```
 
 What it does:
 1. Clones repo to temp directory
-2. Renames `@tanstack/*` → `@syntrix/*` in packages
+2. Renames `@tanstack/*` → target scope packages (default `@roy.alcala/*`)
 3. Builds in dependency order: db-ivm → db → trailbase
 4. Bumps versions
 5. Publishes to npm with dist-tag
@@ -67,6 +70,7 @@ What it does:
 - Go to: https://github.com/royalcala/db/actions/workflows/release-syntrix-trailbase.yml
 - Click "Run workflow" 
 - Select bump type (patch/minor/major/prerelease) and dist-tag
+- Keep `npmScope` as `@roy.alcala` (or override)
 - Watch logs in Actions tab
 
 ---
@@ -105,4 +109,4 @@ What it does:
 - [ ] Tests pass: `pnpm --filter @tanstack/trailbase-db-collection test`
 - [ ] Changes are in syntrix-main
 - [ ] NPM_TOKEN secret exists in GitHub Actions
-- [ ] @syntrix scope is set up in npm
+- [ ] Target npm scope exists and you have publish access

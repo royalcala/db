@@ -23,13 +23,13 @@ What it does:
 
 Automated sync is also available through `.github/workflows/sync-upstream.yml`.
 
-## Independent publishing under `@syntrix`
+## Independent publishing under your npm scope
 
-Focused package stack:
+Focused package stack (default scope `@roy.alcala`):
 
-- `@syntrix/db-ivm`
-- `@syntrix/db`
-- `@syntrix/trailbase-db-collection`
+- `@roy.alcala/db-ivm`
+- `@roy.alcala/db`
+- `@roy.alcala/trailbase-db-collection`
 
 Manual local release command:
 
@@ -40,7 +40,7 @@ pnpm release:syntrix:trailbase
 Release flow:
 
 1. Build all three packages in dependency order
-2. Rewrite package names to `@syntrix/*` inside an isolated temporary clone
+2. Rewrite package names to the target scope inside an isolated temporary clone
 3. Bump versions (default `patch`)
 4. Publish to npm using `latest` dist-tag
 
@@ -48,7 +48,7 @@ The same flow is available in GitHub Actions via `.github/workflows/release-synt
 
 Required repository secret:
 
-- `NPM_TOKEN`: npm token with publish permissions for the `@syntrix` scope
+- `NPM_TOKEN`: npm token with publish permissions for your target scope
 
 ## Trailbase-first development checklist
 
@@ -57,6 +57,6 @@ Required repository secret:
 - Run package tests before publishing:
 
 ```bash
-pnpm --filter @syntrix/trailbase-db-collection test
-pnpm --filter @syntrix/trailbase-db-collection test:e2e
+pnpm --filter @tanstack/trailbase-db-collection test
+pnpm --filter @tanstack/trailbase-db-collection test:e2e
 ```
