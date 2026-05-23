@@ -15,6 +15,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
+publish_or_tag() {
+  local pkg_dir="$1"
+  local pkg_name="$2"
+  local pkg_version="$3"
+
+  cd "$pkg_dir"
+  if npm publish --access public --tag "$DIST_TAG"; then
+    cd ../../
+    return 0
+  fi
+
+  # NPM versions are immutable. If this version already exists, just move/add the dist-tag.
+  if npm view "$pkg_name@$pkg_version" version >/dev/null 2>&1; then
+    npm dist-tag add "$pkg_name@$pkg_version" "$DIST_TAG"
+    cd ../../
+    return 0
+  fi
+
+  cd ../../
+  return 1
+}
+
 case "$BUMP_TYPE" in
   patch|minor|major|prepatch|preminor|premajor|prerelease) ;;
   *)
@@ -76,20 +98,19 @@ replace_text_tree "packages/trailbase-db-collection/dist" "@tanstack/db" "${NPM_
 # Keep versions aligned for the Syntrix release track.
 cd packages/db-ivm
 npm version "$BUMP_TYPE" --no-git-tag-version
+DB_IVM_VERSION="$(node -p "require('./package.json').version")"
 cd ../db
 npm version "$BUMP_TYPE" --no-git-tag-version
+DB_VERSION="$(node -p "require('./package.json').version")"
 cd ../trailbase-db-collection
 npm version "$BUMP_TYPE" --no-git-tag-version
+TRAILBASE_VERSION="$(node -p "require('./package.json').version")"
 cd ../../
 
 if [[ "$DO_PUBLISH" == "true" ]]; then
-  cd packages/db-ivm
-  npm publish --access public --tag "$DIST_TAG"
-  cd ../db
-  npm publish --access public --tag "$DIST_TAG"
-  cd ../trailbase-db-collection
-  npm publish --access public --tag "$DIST_TAG"
-  cd ../../
+  publish_or_tag "packages/db-ivm" "${NPM_SCOPE}/db-ivm" "$DB_IVM_VERSION"
+  publish_or_tag "packages/db" "${NPM_SCOPE}/db" "$DB_VERSION"
+  publish_or_tag "packages/trailbase-db-collection" "${NPM_SCOPE}/trailbase-db-collection" "$TRAILBASE_VERSION"
   echo "Published ${NPM_SCOPE}/db-ivm, ${NPM_SCOPE}/db, and ${NPM_SCOPE}/trailbase-db-collection with bump '$BUMP_TYPE' and tag '$DIST_TAG'."
 else
   echo "Publish skipped (DO_PUBLISH=false)."
