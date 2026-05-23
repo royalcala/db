@@ -57,6 +57,9 @@ bash scripts/release-syntrix-trailbase.sh minor latest
 
 # Or with custom scope
 bash scripts/release-syntrix-trailbase.sh minor latest @syntrix
+
+# Test full pipeline without publishing
+bash scripts/release-syntrix-trailbase.sh patch next @roy.alcala false
 ```
 
 What it does:
