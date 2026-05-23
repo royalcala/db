@@ -2,11 +2,11 @@
   "$schema": "https://unpkg.com/@changesets/config@3.1.2/schema.json",
   "changelog": [
     "@svitejs/changesets-changelog-github-compact",
-    { "repo": "TanStack/db" }
+    { "repo": "royalcala/db" }
   ],
   "commit": false,
   "access": "public",
-  "baseBranch": "main",
+  "baseBranch": "syntrix-main",
   "updateInternalDependencies": "patch",
   "fixed": [],
   "linked": [],

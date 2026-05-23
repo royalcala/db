@@ -3,7 +3,7 @@
   "private": true,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/TanStack/db.git"
+    "url": "git+https://github.com/royalcala/db.git"
   },
   "packageManager": "pnpm@11.1.0",
   "type": "module",
@@ -13,6 +13,8 @@
     "changeset": "changeset",
     "changeset:publish": "changeset publish",
     "changeset:version": "changeset version && tsx scripts/update-example-deps.ts && pnpm install --no-frozen-lockfile",
+    "sync:upstream": "bash scripts/sync-upstream-main.sh",
+    "release:syntrix:trailbase": "bash scripts/release-syntrix-trailbase.sh",
     "format": "prettier --experimental-cli --ignore-unknown '**/*' --write",
     "lint": "pnpm --filter \"./packages/**\" lint",
     "lint-all": "eslint . --fix",

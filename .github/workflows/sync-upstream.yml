@@ -1,0 +1,32 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 11 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository_owner == 'royalcala'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote remove upstream || true
+          git remote add upstream https://github.com/TanStack/db.git
+
+      - name: Sync syntrix-main with upstream/main
+        run: bash scripts/sync-upstream-main.sh syntrix-main main
