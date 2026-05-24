@@ -107,6 +107,10 @@ npm version "$BUMP_TYPE" --no-git-tag-version
 TRAILBASE_VERSION="$(node -p "require('./package.json').version")"
 cd ../../
 
+# Replace workspace internal dependency ranges with concrete publishable versions.
+sed -i "s|\"${NPM_SCOPE}/db-ivm\": \"workspace:\*\"|\"${NPM_SCOPE}/db-ivm\": \"${DB_IVM_VERSION}\"|" packages/db/package.json
+sed -i "s|\"${NPM_SCOPE}/db\": \"workspace:\*\"|\"${NPM_SCOPE}/db\": \"${DB_VERSION}\"|" packages/trailbase-db-collection/package.json
+
 if [[ "$DO_PUBLISH" == "true" ]]; then
   publish_or_tag "packages/db-ivm" "${NPM_SCOPE}/db-ivm" "$DB_IVM_VERSION"
   publish_or_tag "packages/db" "${NPM_SCOPE}/db" "$DB_VERSION"
