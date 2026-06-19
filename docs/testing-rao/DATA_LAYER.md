@@ -329,6 +329,118 @@ Con la Opción C, cada namespace de iroh-docs alimenta una o más collections de
 
 ---
 
+## Flexibilidad: permisos por usuario y crecimiento de namespaces
+
+### Permisos por usuario (sobre los de rol)
+
+Los role grants son el caso base. Pero el `members/<node_id>` en control doc puede tener **overrides** por dispositivo. Esto permite quitar o agregar permisos a un usuario específico sin cambiar su rol:
+
+```json
+// control doc:
+{
+  "members/bob_node_id": {
+    "active": true,
+    "role": "sales",
+    "overrides": {
+      "deny_write": ["operational"],   // Bob no puede escribir facturas
+      "allow_open": ["payroll"]        // pero puede ver nómina (caso especial)
+    }
+  }
+}
+```
+
+El `NamespaceRegistry` ya tiene `can_write()` y `can_open()` — solo hay que agregar la lectura de overrides:
+
+```rust
+// registry.rs — can_write con overrides
+pub fn can_write(&self, org_id: &OrgId, node_id: &NodeId, namespace: &str) -> bool {
+    // 1. Verificar overrides del dispositivo
+    if let Some(device) = self.devices.get(org_id).and_then(|d| d.get(node_id)) {
+        if device.overrides.deny_write.contains(&namespace.to_string()) {
+            return false; // override explícito: NO puede
+        }
+        if device.overrides.allow_write.contains(&namespace.to_string()) {
+            return true;  // override explícito: SÍ puede
+        }
+    }
+
+    // 2. Fallback a role grants (como antes)
+    let role = device.role.clone();
+    // ... chequeo de role.can_write ...
+}
+```
+
+**Casos de uso:**
+- Quitar Write a Bob temporalmente sin cambiar su rol (sanción, auditoría)
+- Dar Read de payroll a un contador específico (el rol "contabilidad" no lo tiene)
+- Bloquear un dispositivo específico sin afectar al resto del rol
+- Dar acceso a un namespace nuevo a un solo usuario para prueba piloto
+
+**No requiere nuevos namespaces.** Solo cambia la entrada `members/<node_id>` en control doc.
+
+### Crecimiento de namespaces
+
+**6 es el piso, no el techo.** La arquitectura soporta agregar namespaces en cualquier momento sin migración:
+
+```
+Fase 1 (MVP): 6 namespaces
+  control, catalogs, operational, payroll, private_*
+
+Fase 2 (+inventario):
+  + inventory      → control de stock, almacenes
+
+Fase 3 (+reportes):
+  + reports        → dashboards pre-calculados, KPIs
+
+Fase 4 (+auditoría):
+  + audit_q4_2026  → namespace temporal para una auditoría específica
+```
+
+**Cómo se agrega un namespace nuevo:**
+
+```rust
+// admin.rs — comando nuevo
+pub async fn add_namespace(state: &mut AppState, org: &str, name: &str) -> anyhow::Result<()> {
+    let org = state.get_org(org)?;
+    let api = state.api();
+    let author = state.author();
+
+    // 1. Crear el doc
+    let doc = api.create().await?;
+
+    // 2. Registrar en control doc
+    control_doc.set_bytes(author, format!("namespaces/{}", name), serde_json::json!({
+        "status": "active",
+        "writers": ["admin"],
+        "readers": ["admin"],
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    })).await?;
+
+    // 3. Registrar en el registry para accept_cb
+    state.registry().write().unwrap()
+        .add_known_namespace(&org.into(), name.to_string());
+    state.registry().write().unwrap()
+        .map_namespace_to_org(doc.id(), org.into());
+
+    // 4. Actualizar role grants si es necesario
+    //    (ej: agregar "inventory" a can_open de "sales")
+
+    // 5. Compartir tickets a los roles que deben leerlo
+    for role in ["admin", "sales"] {
+        let ticket = doc.share(ShareMode::Read, ...).await?;
+        share_ticket_to_role(org, role, name, ticket);
+    }
+
+    Ok(())
+}
+```
+
+**El adapter de TanStack DB también crece automáticamente** — detecta nuevos namespaces en `org_control` y los incluye en el sync sin cambios de código. Si el namespace tiene datos de un tipo conocido (ej: `inventory` contiene productos), el adapter lo mapea a la collection existente.
+
+**El registry ya soporta crecimiento** — `add_known_namespace()`, `map_namespace_to_org()` y wildcards (`can_open: ["*"]`, `can_open: ["org_facturas_*"]`) están implementados en `registry.rs:77-82`.
+
+---
+
 ## Resumen visual final
 
 ```
@@ -352,9 +464,10 @@ Org ACME:
   private_alice ─────────────────────►     userSettingsCollection
   private_bob   ─────────────────────►     userSettingsCollection
 
-  6 namespaces fijos. No crecen con empleados.
+  6 namespaces base (extensible). No crecen con empleados.
   Privacidad a nivel de ticket iroh-docs.
   Separación entre usuarios vía key prefix dentro del namespace.
+  Permisos por usuario vía overrides en members/<node_id>.
 ```
 
 ---
@@ -365,7 +478,7 @@ Org ACME:
 |------|-----------|----------|
 | Sync P2P | iroh-docs | No |
 | Storage | redb | No |
-| **Namespaces** | **6 por org (nivel de seguridad)** | **Sí (antes 2)** |
+| **Namespaces** | **6 base + extensible (nivel de seguridad)** | **Sí (antes 2)** |
 | Capabilities | syntrix-docs (encrypt/decrypt) | No |
 | accept_cb | Bloquea por namespace + active | No |
 | **Query layer** | **TanStack DB + adapter** | **Sí (antes LiveStore)** |
