@@ -1,6 +1,7 @@
 import { fc, test as fcTest } from '@fast-check/vitest'
 import { describe, expect } from 'vitest'
 import {
+  concat,
   createLiveQueryCollection,
   eq,
   materialize,
@@ -13,6 +14,7 @@ import {
   mockSyncCollectionOptions,
   withExpectedRejection,
 } from '../utils.js'
+import { expectAssertionFailure } from '../expected-failure.js'
 import { runTrace } from '../trace-runner.js'
 import type {
   TraceCheckpoint,
@@ -112,20 +114,31 @@ function levelArbitrary(
 }
 
 function actionArbitrary(depth: IncludeDepth): fc.Arbitrary<HistoryAction> {
-  return fc.record({
-    type: fc.constantFrom(
-      `put`,
-      `delete`,
-      `optimisticConfirm`,
-      `optimisticRollback`,
-    ),
-    level: levelArbitrary(depth),
-    id: fc.integer({ min: 0, max: 5 }),
-    parentGroup: fc.integer({ min: 0, max: 2 }),
-    group: fc.integer({ min: 0, max: 2 }),
-    value: fc.integer({ min: -3, max: 3 }),
-    position: fc.integer({ min: -2, max: 2 }),
-  })
+  return levelArbitrary(depth).chain((level) =>
+    fc.record({
+      // Root delete/reinsert has a deterministic expected-failure trace below.
+      // Keep the green fuzz corpus from rediscovering the same defect class.
+      type:
+        level === 0
+          ? fc.constantFrom(
+              `put` as const,
+              `optimisticConfirm` as const,
+              `optimisticRollback` as const,
+            )
+          : fc.constantFrom(
+              `put` as const,
+              `delete` as const,
+              `optimisticConfirm` as const,
+              `optimisticRollback` as const,
+            ),
+      level: fc.constant(level),
+      id: fc.integer({ min: 0, max: 5 }),
+      parentGroup: fc.integer({ min: 0, max: 2 }),
+      group: fc.integer({ min: 0, max: 2 }),
+      value: fc.integer({ min: -3, max: 3 }),
+      position: fc.integer({ min: -2, max: 2 }),
+    }),
+  )
 }
 
 function ensureActionsTargetRows(
@@ -610,16 +623,6 @@ async function settleOptimisticAction(
   })
 }
 
-function expectAssertionFailure<TArgs extends Array<unknown>>(
-  assertion: (...args: TArgs) => Promise<void>,
-): (...args: TArgs) => Promise<void> {
-  return async (...args) => {
-    await expect(assertion(...args)).rejects.toMatchObject({
-      name: `AssertionError`,
-    })
-  }
-}
-
 async function applyAction(
   action: HistoryAction,
   sources: Sources,
@@ -776,7 +779,9 @@ function createStructuralTraceContext(
 async function cleanupStructuralTrace({
   incremental,
   sources,
-}: StructuralTraceContext): Promise<void> {
+}: Pick<StructuralTraceContext, `sources`> & {
+  incremental: { cleanup: () => Promise<void> }
+}): Promise<void> {
   await incremental.cleanup()
   await cleanupSources(sources)
 }
@@ -801,7 +806,24 @@ function createStructuralTraceDriver(
 
 type FullRowBatchStep =
   | { level: 0; changes: Array<SyncChange<RootRow>> }
-  | { level: 1; changes: Array<SyncChange<ChildRow>> }
+  | { level: IncludeDepth; changes: Array<SyncChange<ChildRow>> }
+
+type FullRowBatchInput = {
+  level: 0 | IncludeDepth
+  changes: Array<{
+    type: `put` | `delete`
+    id: number
+    parentGroup: number
+    group: number
+    value: number
+    position: number
+  }>
+}
+
+type FullRowBatchScenario = {
+  depth: IncludeDepth
+  steps: Array<FullRowBatchStep>
+}
 
 function updateModel<T extends { id: number }>(
   model: Map<number, T>,
@@ -816,12 +838,11 @@ function updateModel<T extends { id: number }>(
   }
 }
 
-function createFullRowBatchTraceDriver(): TraceDriver<
-  FullRowBatchStep,
-  StructuralTraceContext
-> {
+function createFullRowBatchTraceDriver(
+  depth: IncludeDepth,
+): TraceDriver<FullRowBatchStep, StructuralTraceContext> {
   return {
-    setup: () => createStructuralTraceContext(1, `full`),
+    setup: () => createStructuralTraceContext(depth, `full`),
     start: ({ incremental }) => incremental.preload(),
     apply: (step, { sources, roots, levels }) => {
       if (step.level === 0) {
@@ -830,8 +851,9 @@ function createFullRowBatchTraceDriver(): TraceDriver<
         return
       }
 
-      sources.levels[0].writeBatch(step.changes)
-      updateModel(levels[0]!, step.changes)
+      const level = step.level - 1
+      sources.levels[level]!.writeBatch(step.changes)
+      updateModel(levels[level]!, step.changes)
     },
     cleanup: cleanupStructuralTrace,
   }
@@ -886,6 +908,461 @@ const fullRowBatchTrace: Array<FullRowBatchStep> = [
     ],
   },
 ]
+
+const fullRowSharedRoutingSeed: FullRowBatchScenario = {
+  depth: 1,
+  steps: [
+    {
+      level: 0,
+      changes: [
+        { type: `insert`, value: batchRoot(0, 2, 0, 0) },
+        { type: `insert`, value: batchRoot(1, 2, 0, 0) },
+      ],
+    },
+    {
+      level: 0,
+      changes: [{ type: `delete`, value: batchRoot(1, 2, 0, 0) }],
+    },
+    {
+      level: 0,
+      changes: [{ type: `insert`, value: batchRoot(1, 0, 0, 0) }],
+    },
+    {
+      level: 1,
+      changes: [{ type: `insert`, value: batchChild(0, 2, 0, 0) }],
+    },
+  ],
+}
+
+function fullRowBatchInputArbitrary(
+  depth: IncludeDepth,
+  levels: `all` | `children`,
+  maxBatchSize = 3,
+): fc.Arbitrary<FullRowBatchInput> {
+  const levelsArbitrary =
+    levels === `all`
+      ? levelArbitrary(depth)
+      : fc.integer({ min: 1, max: depth }).map((level) => level as IncludeDepth)
+
+  return levelsArbitrary.chain((level) =>
+    fc
+      .uniqueArray(
+        fc.record({
+          // Root delete/reinsert has a known failing seed below. Keep the
+          // generated green corpus out of that class while still generating
+          // inserts, replacements, and multi-change batches at the root.
+          type:
+            level === 0
+              ? fc.constant(`put` as const)
+              : fc.constantFrom(`put` as const, `delete` as const),
+          id: fc.integer({ min: 0, max: 5 }),
+          parentGroup: fc.integer({ min: 0, max: 4 }),
+          group: fc.integer({ min: 0, max: 4 }),
+          value: fc.integer({ min: -3, max: 3 }),
+          position: fc.integer({ min: -2, max: 2 }),
+        }),
+        {
+          selector: (change) => change.id,
+          minLength: 1,
+          maxLength: maxBatchSize,
+        },
+      )
+      .map((changes) => ({ level, changes })),
+  )
+}
+
+function createConnectedBatchPrefix(
+  depth: IncludeDepth,
+): Array<FullRowBatchStep> {
+  // Generated ids stop at 5, so this path survives every later batch and
+  // guarantees that the selected depth is observable at every checkpoint.
+  const steps: Array<FullRowBatchStep> = [
+    {
+      level: 0,
+      changes: [{ type: `insert`, value: batchRoot(100, 100, 100, 0) }],
+    },
+  ]
+
+  for (let level = 1; level <= depth; level++) {
+    steps.push({
+      level: level as IncludeDepth,
+      changes: [
+        {
+          type: `insert`,
+          value: {
+            ...batchChild(100 + level, 99 + level, 100 + level, 0),
+            group: 100 + level,
+          },
+        },
+      ],
+    })
+  }
+
+  return steps
+}
+
+function createConnectedBatchBranches(
+  depth: IncludeDepth,
+): Array<FullRowBatchStep> {
+  const branchRoots = [100, 200]
+  const steps: Array<FullRowBatchStep> = [
+    {
+      level: 0,
+      changes: branchRoots.map((id) => ({
+        type: `insert`,
+        value: batchRoot(id, id, id, 0),
+      })),
+    },
+  ]
+
+  for (let level = 1; level <= depth; level++) {
+    steps.push({
+      level: level as IncludeDepth,
+      changes: branchRoots.map((rootId) => ({
+        type: `insert`,
+        value: {
+          ...batchChild(rootId + level, rootId + level - 1, rootId + level, 0),
+          group: rootId + level,
+        },
+      })),
+    })
+  }
+
+  return steps
+}
+
+function normalizeFullRowBatchInputs(
+  depth: IncludeDepth,
+  inputs: Array<FullRowBatchInput>,
+  allowChildRelationshipUpdates: boolean,
+): FullRowBatchScenario {
+  const roots = new Map<number, RootRow>([[100, batchRoot(100, 100, 100, 0)]])
+  const levels = Array.from(
+    { length: 4 },
+    (_, level) =>
+      new Map<number, ChildRow>(
+        level < depth
+          ? [
+              [
+                101 + level,
+                {
+                  ...batchChild(101 + level, 100 + level, 101 + level, 0),
+                  group: 101 + level,
+                },
+              ],
+            ]
+          : [],
+      ),
+  )
+  const steps = createConnectedBatchPrefix(depth)
+
+  for (const input of inputs) {
+    if (input.level === 0) {
+      const changes = input.changes.map((change): SyncChange<RootRow> => {
+        const current = roots.get(change.id)
+        if (change.type === `delete` && current) {
+          roots.delete(change.id)
+          return { type: `delete`, value: current }
+        }
+
+        const value: RootRow = {
+          id: change.id,
+          group: current ? current.group : change.group,
+          value: change.value,
+          position: change.position,
+        }
+        roots.set(value.id, value)
+        return { type: current ? `update` : `insert`, value }
+      })
+      steps.push({ level: 0, changes })
+      continue
+    }
+
+    const model = levels[input.level - 1]!
+    const changes = input.changes.map((change): SyncChange<ChildRow> => {
+      const current = model.get(change.id)
+      if (change.type === `delete` && current) {
+        model.delete(change.id)
+        return { type: `delete`, value: current }
+      }
+
+      const value: ChildRow = {
+        id: change.id,
+        parentGroup:
+          !allowChildRelationshipUpdates && current
+            ? current.parentGroup
+            : change.parentGroup,
+        group:
+          !allowChildRelationshipUpdates && current
+            ? current.group
+            : change.group,
+        value: change.value,
+        position: change.position,
+      }
+      model.set(value.id, value)
+      return { type: current ? `update` : `insert`, value }
+    })
+    steps.push({ level: input.level, changes })
+  }
+
+  return { depth, steps }
+}
+
+function fullRowBatchScenarioAtDepthArbitrary(
+  depth: IncludeDepth,
+): fc.Arbitrary<FullRowBatchScenario> {
+  return fc
+    .array(fullRowBatchInputArbitrary(depth, `all`), {
+      minLength: 1,
+      maxLength: 10,
+    })
+    .map((inputs) => {
+      const noise = normalizeFullRowBatchInputs(
+        depth,
+        inputs,
+        false,
+      ).steps.slice(depth + 1)
+      const changes: Array<SyncChange<ChildRow>> = [100, 200].map((rootId) => ({
+        type: `update`,
+        value: {
+          ...batchChild(
+            rootId + depth,
+            rootId + depth - 1,
+            rootId + depth + 1,
+            0,
+          ),
+          group: rootId + depth,
+        },
+      }))
+
+      return {
+        depth,
+        steps: [
+          ...createConnectedBatchBranches(depth),
+          ...noise,
+          { level: depth, changes },
+        ],
+      }
+    })
+}
+
+type VisibleRelationshipTransition = `reparent` | `rekey`
+
+function visibleRelationshipScenarioArbitrary(
+  depth: IncludeDepth,
+  transition: VisibleRelationshipTransition,
+): fc.Arbitrary<FullRowBatchScenario> {
+  return fc
+    .array(fullRowBatchInputArbitrary(depth, `children`, 1), {
+      minLength: 1,
+      maxLength: 10,
+    })
+    .map((inputs) => {
+      const noise = normalizeFullRowBatchInputs(
+        depth,
+        inputs,
+        true,
+      ).steps.slice(depth + 1)
+      const value: ChildRow = {
+        ...batchChild(101, transition === `reparent` ? 200 : 100, 101, 0),
+        group: transition === `rekey` ? 150 : 101,
+      }
+
+      return {
+        depth,
+        steps: [
+          ...createConnectedBatchBranches(depth),
+          ...noise,
+          { level: 1, changes: [{ type: `update`, value }] },
+        ],
+      }
+    })
+}
+
+async function expectFullRowBatchScenarioMatches({
+  depth,
+  steps,
+}: FullRowBatchScenario): Promise<void> {
+  await runTrace({
+    steps,
+    driver: createFullRowBatchTraceDriver(depth),
+    projection: structuralProjection,
+  })
+}
+
+function recomputeFullRowBatchScenario(
+  { depth, steps }: FullRowBatchScenario,
+  stepCount: number,
+): Array<OracleNode> {
+  const roots = new Map<number, RootRow>()
+  const levels = Array.from({ length: 4 }, () => new Map<number, ChildRow>())
+
+  for (const step of steps.slice(0, stepCount)) {
+    if (step.level === 0) {
+      updateModel(roots, step.changes)
+    } else {
+      updateModel(levels[step.level - 1]!, step.changes)
+    }
+  }
+
+  return recompute(roots, levels, depth)
+}
+
+type FlatMaterialization = `array` | `concat`
+
+function createFlatMaterializationQuery(
+  materialization: FlatMaterialization,
+  sources: Sources,
+) {
+  if (materialization === `array`) {
+    return createLiveQueryCollection((q) =>
+      q
+        .from({ root: sources.roots.collection })
+        .orderBy(({ root }) => root.position)
+        .orderBy(({ root }) => root.id)
+        .select(({ root }) => ({
+          id: root.id,
+          group: root.group,
+          children: materialize(
+            q
+              .from({ child: sources.levels[0].collection })
+              .where(({ child }) => eq(child.parentGroup, root.group))
+              .orderBy(({ child }) => child.position)
+              .orderBy(({ child }) => child.id)
+              .select(({ child }) => ({ id: child.id, value: child.value })),
+          ),
+        })),
+    )
+  }
+
+  return createLiveQueryCollection((q) =>
+    q
+      .from({ root: sources.roots.collection })
+      .orderBy(({ root }) => root.position)
+      .orderBy(({ root }) => root.id)
+      .select(({ root }) => ({
+        id: root.id,
+        group: root.group,
+        content: concat(
+          toArray(
+            q
+              .from({ child: sources.levels[0].collection })
+              .where(({ child }) => eq(child.parentGroup, root.group))
+              .orderBy(({ child }) => child.position)
+              .orderBy(({ child }) => child.id)
+              .select(({ child }) => child.value),
+          ),
+        ),
+      })),
+  )
+}
+
+type FlatMaterializationContext = Omit<
+  StructuralTraceContext,
+  `incremental`
+> & {
+  incremental: ReturnType<typeof createFlatMaterializationQuery>
+}
+
+function createFlatMaterializationDriver(
+  materialization: FlatMaterialization,
+): TraceDriver<FullRowBatchStep, FlatMaterializationContext> {
+  return {
+    setup: () => {
+      const sources = createSources(`full`)
+      return {
+        depth: 1,
+        sources,
+        incremental: createFlatMaterializationQuery(materialization, sources),
+        roots: new Map<number, RootRow>(),
+        levels: Array.from({ length: 4 }, () => new Map<number, ChildRow>()),
+      }
+    },
+    start: ({ incremental }) => incremental.preload(),
+    apply: (step, { sources, roots, levels }) => {
+      if (step.level === 0) {
+        sources.roots.writeBatch(step.changes)
+        updateModel(roots, step.changes)
+        return
+      }
+
+      if (step.level !== 1) {
+        throw new Error(`Flat materialization only supports depth 1`)
+      }
+      sources.levels[0].writeBatch(step.changes)
+      updateModel(levels[0]!, step.changes)
+    },
+    cleanup: cleanupStructuralTrace,
+  }
+}
+
+type FlatMaterializationResult = Array<
+  | {
+      id: number
+      group: number
+      children: Array<{ id: number; value: number }>
+    }
+  | { id: number; group: number; content: string }
+>
+
+function recomputeFlatMaterialization(
+  materialization: FlatMaterialization,
+  roots: Map<number, RootRow>,
+  children: Map<number, ChildRow>,
+): FlatMaterializationResult {
+  return [...roots.values()].sort(compareRows).map((root) => {
+    const matching = [...children.values()]
+      .filter((child) => child.parentGroup === root.group)
+      .sort(compareRows)
+    return materialization === `array`
+      ? {
+          id: root.id,
+          group: root.group,
+          children: matching.map(({ id, value }) => ({ id, value })),
+        }
+      : {
+          id: root.id,
+          group: root.group,
+          content: matching.map(({ value }) => String(value)).join(``),
+        }
+  })
+}
+
+function flatMaterializationProjection(
+  materialization: FlatMaterialization,
+): TraceProjection<
+  FlatMaterializationContext,
+  unknown,
+  FlatMaterializationResult
+> {
+  return {
+    observe: ({ incremental }) => stripVirtualProperties(incremental.toArray),
+    recompute: ({ roots, levels }) =>
+      recomputeFlatMaterialization(materialization, roots, levels[0]!),
+    assertEqual: (observed, expected) => {
+      expect(observed).toEqual(expected)
+      return undefined
+    },
+  }
+}
+
+const flatMaterializationScenarioArbitrary = fc
+  .array(fullRowBatchInputArbitrary(1, `all`), {
+    minLength: 1,
+    maxLength: 12,
+  })
+  .map((inputs) => normalizeFullRowBatchInputs(1, inputs, false))
+
+async function expectFlatMaterializationScenarioMatches(
+  materialization: FlatMaterialization,
+  scenario: FullRowBatchScenario,
+): Promise<void> {
+  await runTrace({
+    steps: scenario.steps,
+    driver: createFlatMaterializationDriver(materialization),
+    projection: flatMaterializationProjection(materialization),
+  })
+}
 
 const structuralProjection: TraceProjection<
   StructuralTraceContext,
@@ -1149,31 +1626,160 @@ async function expectMaterializeScenarioMatches({
   })
 }
 
+const intraBatchChildHandOffScenario: FullRowBatchScenario = {
+  depth: 1,
+  steps: [
+    {
+      level: 0,
+      changes: [
+        { type: `insert`, value: batchRoot(0, 1, 0, 0) },
+        { type: `insert`, value: batchRoot(1, 3, 0, 0) },
+      ],
+    },
+    {
+      level: 1,
+      changes: [
+        { type: `insert`, value: batchChild(5, 3, 0, 0) },
+        { type: `insert`, value: batchChild(1, 1, 0, 0) },
+      ],
+    },
+    {
+      level: 1,
+      changes: [
+        { type: `update`, value: batchChild(1, 0, 0, 0) },
+        { type: `update`, value: batchChild(5, 1, 0, 0) },
+      ],
+    },
+  ],
+}
+
 describe(`includes recompute oracle`, () => {
+  fcTest(`covers a visible relationship transition at every depth`, () => {
+    const scenarios = ([1, 2, 3, 4] as const).map(
+      (depth) =>
+        fc.sample(visibleRelationshipScenarioArbitrary(depth, `reparent`), {
+          numRuns: 1,
+          seed: 1721 + depth,
+        })[0]!,
+    )
+
+    for (const scenario of scenarios) {
+      const beforeTransition = recomputeFullRowBatchScenario(
+        scenario,
+        scenario.steps.length - 1,
+      )
+      expect(
+        recomputeFullRowBatchScenario(scenario, scenario.steps.length),
+      ).not.toEqual(beforeTransition)
+    }
+  })
+
+  for (const materialization of [`array`, `concat`] as const) {
+    fcTest(
+      `discovered trace: ${materialization} follows an intra-batch child hand-off`,
+      expectAssertionFailure(
+        async () => {
+          await expectFlatMaterializationScenarioMatches(
+            materialization,
+            intraBatchChildHandOffScenario,
+          )
+        },
+        { checkpoint: 3 },
+      ),
+    )
+  }
+
+  fcTest.prop(
+    [
+      fc.constantFrom<FlatMaterialization>(`array`, `concat`),
+      flatMaterializationScenarioArbitrary,
+    ],
+    {
+      numRuns: 30,
+      seed: 1721,
+    },
+  )(`matches recomputation for flat materializations`, (kind, scenario) =>
+    expectFlatMaterializationScenarioMatches(kind, scenario),
+  )
+
+  for (const depth of [1, 2, 3, 4] as const) {
+    fcTest.prop([fullRowBatchScenarioAtDepthArbitrary(depth)], {
+      numRuns: 10,
+      seed: 1719 + depth,
+    })(
+      `matches recomputation for visible multi-row batches at depth ${depth}`,
+      expectFullRowBatchScenarioMatches,
+    )
+
+    const transitions: Array<VisibleRelationshipTransition> =
+      depth === 1 ? [`reparent`] : [`reparent`, `rekey`]
+    for (const transition of transitions) {
+      fcTest.prop([visibleRelationshipScenarioArbitrary(depth, transition)], {
+        numRuns: 6,
+        seed: 1721 + depth,
+      })(
+        transition === `rekey` && depth >= 3
+          ? `discovered trace: a visible rekey at depth ${depth}`
+          : `matches recomputation for a visible ${transition} at depth ${depth}`,
+        async (scenario) => {
+          const beforeTransition = recomputeFullRowBatchScenario(
+            scenario,
+            scenario.steps.length - 1,
+          )
+          const result = recomputeFullRowBatchScenario(
+            scenario,
+            scenario.steps.length,
+          )
+
+          expect(result).not.toEqual(beforeTransition)
+          if (transition === `rekey` && depth >= 3) {
+            await expectAssertionFailure(
+              () => expectFullRowBatchScenarioMatches(scenario),
+              { checkpoint: scenario.steps.length },
+            )()
+          } else {
+            await expectFullRowBatchScenarioMatches(scenario)
+          }
+        },
+      )
+    }
+  }
+
   fcTest(
     `discovered seed: nested scalar materialization follows a reference update`,
-    expectAssertionFailure(async () => {
-      await runTrace({
-        steps: [
-          { type: `insert`, insert: `root-1` },
-          { type: `insert`, insert: `middle-1` },
-          { type: `insert`, insert: `shared-1` },
-          { type: `insert`, insert: `leaf-1` },
-          { type: `redirectMiddle`, id: 1, sharedId: 2 },
-        ],
-        driver: createMaterializeTraceDriver(false),
-        projection: materializeProjection,
-      })
-    }),
+    expectAssertionFailure(
+      async () => {
+        await runTrace({
+          steps: [
+            { type: `insert`, insert: `root-1` },
+            { type: `insert`, insert: `middle-1` },
+            { type: `insert`, insert: `shared-1` },
+            { type: `insert`, insert: `leaf-1` },
+            { type: `redirectMiddle`, id: 1, sharedId: 2 },
+          ],
+          driver: createMaterializeTraceDriver(false),
+          projection: materializeProjection,
+        })
+      },
+      { checkpoint: 5 },
+    ),
   )
 
   fcTest(`matches recomputation for full-row sync batches`, async () => {
     await runTrace({
       steps: fullRowBatchTrace,
-      driver: createFullRowBatchTraceDriver(),
+      driver: createFullRowBatchTraceDriver(1),
       projection: structuralProjection,
     })
   })
+
+  fcTest(
+    `discovered seed: a reinserted parent drops its old shared route`,
+    expectAssertionFailure(
+      () => expectFullRowBatchScenarioMatches(fullRowSharedRoutingSeed),
+      { checkpoint: 4 },
+    ),
+  )
 
   fcTest(`supports repeated optimistic rollbacks in one history`, async () => {
     await expectScenarioMatches({
@@ -1451,7 +2057,7 @@ describe(`includes recompute oracle`, () => {
     seed: 1685,
   })(
     `known seed: shared scalar materialization preserves the deepest row`,
-    expectAssertionFailure(expectMaterializeScenarioMatches),
+    expectAssertionFailure(expectMaterializeScenarioMatches, { checkpoint: 6 }),
   )
 
   fcTest.prop([fc.constant(`correlation-key-update`)], {
@@ -1459,130 +2065,139 @@ describe(`includes recompute oracle`, () => {
     seed: 1658,
   })(
     `discovered seed: parent correlation-key update rematerializes children`,
-    expectAssertionFailure(async () => {
-      const roots = createControlledCollection<RootRow>(
-        `correlation-seed-roots`,
-      )
-      const children = createControlledCollection<ChildRow>(
-        `correlation-seed-children`,
-      )
-      const live = createLiveQueryCollection((q) =>
-        q.from({ root: roots.collection }).select(({ root }) => ({
-          id: root.id,
-          group: root.group,
-          children: toArray(
-            q
-              .from({ child: children.collection })
-              .where(({ child }) => eq(child.parentGroup, root.group))
-              .select(({ child }) => ({ id: child.id })),
-          ),
-        })),
-      )
+    expectAssertionFailure(
+      async () => {
+        const roots = createControlledCollection<RootRow>(
+          `correlation-seed-roots`,
+        )
+        const children = createControlledCollection<ChildRow>(
+          `correlation-seed-children`,
+        )
+        const live = createLiveQueryCollection((q) =>
+          q.from({ root: roots.collection }).select(({ root }) => ({
+            id: root.id,
+            group: root.group,
+            children: toArray(
+              q
+                .from({ child: children.collection })
+                .where(({ child }) => eq(child.parentGroup, root.group))
+                .select(({ child }) => ({ id: child.id })),
+            ),
+          })),
+        )
 
-      try {
-        await live.preload()
-        children.write(`insert`, {
-          id: 1,
-          parentGroup: 0,
-          group: 0,
-          value: 0,
-          position: 0,
-        })
-        children.write(`insert`, {
-          id: 2,
-          parentGroup: 1,
-          group: 0,
-          value: 0,
-          position: 0,
-        })
-        roots.write(`insert`, { id: 1, group: 1, value: 0, position: 0 })
-        roots.write(`update`, { id: 1, group: 0, value: 0, position: 0 })
+        try {
+          await live.preload()
+          children.write(`insert`, {
+            id: 1,
+            parentGroup: 0,
+            group: 0,
+            value: 0,
+            position: 0,
+          })
+          children.write(`insert`, {
+            id: 2,
+            parentGroup: 1,
+            group: 0,
+            value: 0,
+            position: 0,
+          })
+          roots.write(`insert`, { id: 1, group: 1, value: 0, position: 0 })
+          roots.write(`update`, { id: 1, group: 0, value: 0, position: 0 })
 
-        expect(stripVirtualProperties(live.toArray)).toEqual([
-          { id: 1, group: 0, children: [{ id: 1 }] },
-        ])
-      } finally {
-        await live.cleanup()
-        await Promise.all([
-          roots.collection.cleanup(),
-          children.collection.cleanup(),
-        ])
-      }
-    }),
+          expect(stripVirtualProperties(live.toArray)).toEqual([
+            { id: 1, group: 0, children: [{ id: 1 }] },
+          ])
+        } finally {
+          await live.cleanup()
+          await Promise.all([
+            roots.collection.cleanup(),
+            children.collection.cleanup(),
+          ])
+        }
+      },
+      { message: /children/ },
+    ),
   )
 
   fcTest.prop([fc.constant(`#1454`)], { numRuns: 1, seed: 1454 })(
     `known seed: alpha-renaming a duplicate sibling alias preserves results`,
-    expectAssertionFailure(async () => {
-      const roots = createControlledCollection<RootRow>(`alias-seed-roots`, [
-        { id: 1, group: 1, value: 0, position: 0 },
-      ])
-      const issues = createControlledCollection<ChildRow>(`alias-seed-issues`, [
-        {
-          id: 10,
-          parentGroup: 1,
-          group: 10,
-          value: 10,
-          position: 0,
-        },
-      ])
-      const tags = createControlledCollection<ChildRow>(`alias-seed-tags`, [
-        {
-          id: 20,
-          parentGroup: 1,
-          group: 20,
-          value: 20,
-          position: 0,
-        },
-      ])
-
-      try {
-        const uniqueAliases = await queryOnce((q) =>
-          q.from({ root: roots.collection }).select(({ root }) => ({
-            id: root.id,
-            issues: toArray(
-              q
-                .from({ issue: issues.collection })
-                .where(({ issue }) => eq(issue.parentGroup, root.group))
-                .select(({ issue }) => ({ id: issue.id })),
-            ),
-            tags: toArray(
-              q
-                .from({ tag: tags.collection })
-                .where(({ tag }) => eq(tag.parentGroup, root.group))
-                .select(({ tag }) => ({ id: tag.id })),
-            ),
-          })),
-        )
-        const duplicateAliases = await queryOnce((q) =>
-          q.from({ root: roots.collection }).select(({ root }) => ({
-            id: root.id,
-            issues: toArray(
-              q
-                .from({ item: issues.collection })
-                .where(({ item }) => eq(item.parentGroup, root.group))
-                .select(({ item }) => ({ id: item.id })),
-            ),
-            tags: toArray(
-              q
-                .from({ item: tags.collection })
-                .where(({ item }) => eq(item.parentGroup, root.group))
-                .select(({ item }) => ({ id: item.id })),
-            ),
-          })),
-        )
-
-        expect(stripVirtualProperties(duplicateAliases)).toEqual(
-          stripVirtualProperties(uniqueAliases),
-        )
-      } finally {
-        await Promise.all([
-          roots.collection.cleanup(),
-          issues.collection.cleanup(),
-          tags.collection.cleanup(),
+    expectAssertionFailure(
+      async () => {
+        const roots = createControlledCollection<RootRow>(`alias-seed-roots`, [
+          { id: 1, group: 1, value: 0, position: 0 },
         ])
-      }
-    }),
+        const issues = createControlledCollection<ChildRow>(
+          `alias-seed-issues`,
+          [
+            {
+              id: 10,
+              parentGroup: 1,
+              group: 10,
+              value: 10,
+              position: 0,
+            },
+          ],
+        )
+        const tags = createControlledCollection<ChildRow>(`alias-seed-tags`, [
+          {
+            id: 20,
+            parentGroup: 1,
+            group: 20,
+            value: 20,
+            position: 0,
+          },
+        ])
+
+        try {
+          const uniqueAliases = await queryOnce((q) =>
+            q.from({ root: roots.collection }).select(({ root }) => ({
+              id: root.id,
+              issues: toArray(
+                q
+                  .from({ issue: issues.collection })
+                  .where(({ issue }) => eq(issue.parentGroup, root.group))
+                  .select(({ issue }) => ({ id: issue.id })),
+              ),
+              tags: toArray(
+                q
+                  .from({ tag: tags.collection })
+                  .where(({ tag }) => eq(tag.parentGroup, root.group))
+                  .select(({ tag }) => ({ id: tag.id })),
+              ),
+            })),
+          )
+          const duplicateAliases = await queryOnce((q) =>
+            q.from({ root: roots.collection }).select(({ root }) => ({
+              id: root.id,
+              issues: toArray(
+                q
+                  .from({ item: issues.collection })
+                  .where(({ item }) => eq(item.parentGroup, root.group))
+                  .select(({ item }) => ({ id: item.id })),
+              ),
+              tags: toArray(
+                q
+                  .from({ item: tags.collection })
+                  .where(({ item }) => eq(item.parentGroup, root.group))
+                  .select(({ item }) => ({ id: item.id })),
+              ),
+            })),
+          )
+
+          expect(stripVirtualProperties(duplicateAliases)).toEqual(
+            stripVirtualProperties(uniqueAliases),
+          )
+        } finally {
+          await Promise.all([
+            roots.collection.cleanup(),
+            issues.collection.cleanup(),
+            tags.collection.cleanup(),
+          ])
+        }
+      },
+      { message: /deeply equal/ },
+    ),
   )
 
   fcTest.prop([fc.constant(`#1444`)], { numRuns: 1, seed: 1444 })(
